@@ -26,6 +26,7 @@
 #    22901  24010
 #
 
+import collections
 import socket
 import struct
 import time
@@ -357,12 +358,13 @@ class AG_connection(object):
         self._device_type = device_type
         self._connected = False
         self._open = False
-        self._timeout = 2.0
         self._rx_buffer = bytearray()
+        self._rx_queue = collections.deque()
 
         self._address = f'{host_address}:{port_number}'
-        self._socket = socket.create_connection((host_address, port_number), timeout=2)
+        self._socket = socket.create_connection((host_address, port_number), timeout=2.0)
         self._connected = True
+        self._socket.settimeout(0.05)
 
         self.command(f'{self._device_type}_OPEN_REQ')
         self._open = True
@@ -378,42 +380,68 @@ class AG_connection(object):
         # print(f'sent {tel}')
         # print(f'sent {tel["buffer"]}')
 
-    def recv(self, expect=None, deadline=None):
+    def _recv(self, deadline=None):
+        """
+        Wait for a telegram or deadline
+        """
+        while True:
+            try:
+                tel = AG_telegram(self._rx_buffer)
+                # print(f'recv {tel}')
+                # print(f'recv {tel.buffer}')
+                del self._rx_buffer[:len(tel)]
+                return tel
+            except TypeError:
+                # we need more bytes
+                pass
+            try:
+                if time.time() >= deadline:
+                    return None
+                self._rx_buffer.extend(self._socket.recv(512))
+            except socket.timeout:
+                # loop back and try again
+                pass
+
+    def recv(self, expect=None, timeout=0.5):
         """
         Receive a telegram.
 
         If expect specifies a telegram by name, only a telegram of that type
         will be returned.
+
+        If timeout is not specified, we will poll for a telegram and return
+        immediately. Otherwise, if no telegram is received by the deadline,
+        None is returned.
+
+        CAN_DATA_IND telegrams received while waiting for other telegrams
+        are buffered to avoid missing them.
         """
-        if deadline is None:
-            deadline = time.time() + self._timeout
-        while expect is not None:
-            # wait for something to come in
-            tel = self.recv(deadline=deadline)
-
-            # is it what we expected?
-            if tel['name'] == expect:
-                return tel
-
-        # not looking for anything specific, just get anything that shows up
+        deadline = time.time() + timeout
         while True:
-            try:
-                tel = AG_telegram(self._rx_buffer)
-                # print(f'recv {tel.buffer.hex(sep=" ")}')
-                # print(f'recv {tel.buffer}')
-                del self._rx_buffer[:len(tel)]
-                return tel
-            except TypeError:
-                # waiting for more bytes
-                pass
-            try:
-                if time.time() >= deadline:
-                    raise socket.timeout
-                self._rx_buffer.extend(self._socket.recv(512))
-            except socket.timeout:
-                raise RuntimeError(f'timed out waiting for data with {self._rx_buffer}')
+            # if we're looking for a CAN message and we have one queued, return it
+            if expect == 'CAN_DATA_IND':
+                try:
+                    return self._rx_queue.popleft()
+                except IndexError:
+                    pass
 
-    def command(self, name, **kwargs):
+            # wait for something to come in
+            tel = self._recv(deadline=deadline)
+
+            # timed out?
+            if tel is None:
+                return None
+
+            # if we are trying to match something, did we get it?
+            if expect is not None:
+                if tel['name'] == expect:
+                    return tel
+
+            # if it's a CAN message, buffer it for later
+            if tel['name'] == 'CAN_DATA_IND':
+                self._rx_queue.append(tel)
+
+    def command(self, name, timeout=0.5, **kwargs):
         """
         Send a request telegram and return the confirmation telegram. It's assumed that
         the reply telegram has a result field, and that its name corresponds to
@@ -421,7 +449,7 @@ class AG_connection(object):
         """
         expect = name.replace('_REQ', '_CNF')
         self.send(name, **kwargs)
-        rsp = self.recv(expect)
+        rsp = self.recv(expect=expect, timeout=timeout)
         if rsp.is_failure:
             raise RuntimeError(f'error executing {name}')
         return rsp
@@ -506,14 +534,14 @@ class AG_CAN_connection(AG_connection):
                          filter_4_start=0, filter_4_end=0x1FFFFFFF)
         else:
             self.command('CAN_SET_FILTER_REQ',
-                         filters['masks'][0], filters['values'][0],
-                         filters['masks'][1], filters['values'][1],
-                         filters['masks'][2], filters['values'][2],
-                         filters['masks'][3], filters['values'][3],
-                         filters['ranges'][0][0], filters['ranges'][0][1],
-                         filters['ranges'][1][0], filters['ranges'][1][1],
-                         filters['ranges'][2][0], filters['ranges'][2][1],
-                         filters['ranges'][3][0], filters['ranges'][3][1])
+                         filter_1_mask=filters['masks'][0], filter_1_value=filters['values'][0],
+                         filter_2_mask=filters['masks'][1], filter_2_value=filters['values'][1],
+                         filter_3_mask=filters['masks'][2], filter_3_value=filters['values'][2],
+                         filter_4_mask=filters['masks'][3], filter_4_value=filters['values'][3],
+                         filter_1_start=filters['ranges'][0][0], filter_1_end=filters['ranges'][0][1],
+                         filter_2_start=filters['ranges'][1][0], filter_2_end=filters['ranges'][1][1],
+                         filter_3_start=filters['ranges'][2][0], filter_3_end=filters['ranges'][2][1],
+                         filter_4_start=filters['ranges'][3][0], filter_4_end=filters['ranges'][3][1])
 
     def set_digital_out(self, pin, value):
         """
@@ -585,16 +613,32 @@ class AG_CAN_connection(AG_connection):
                   can_format=FMT_EXTENDED if extended_id else 0,
                   can_data=data)
 
-    def recv_can(self, expect_id=None):
+    def recv_can(self, expect_id=None, timeout=0.5):
         """
         Convenience wrapper for receiving CAN data.
+
+        Returns a dictionary:
+        {
+            'can_id': 0xNNN,
+            'extended_id': True/False,
+            'data': bytes,
+            'timestamp_us': receive timestamp
+        }
+
+        XXX timeout behaviour is broken in the case of spammy traffic
         """
         while True:
-            tel = self.recv(expect='CAN_DATA_IND')
-            if expect_id is not None:
-                if tel['can_id'] != expect_id:
-                    continue
-            return tel['can_id'], tel['can_data']
+            tel = self.recv(expect='CAN_DATA_IND', timeout=timeout)
+            if tel is not None:
+                if expect_id is not None:
+                    if tel['can_id'] != expect_id:
+                        continue
+            else:
+                return None
+            return {'can_id':       tel['can_id'],
+                    'extended_id':  True if (tel['can_format'] & FMT_EXTENDED) else False,
+                    'data':         tel['can_data'],
+                    'timestamp':    tel['timestamp_sec'] * 1000000 + tel['timestamp_usec']}
 
 
 if __name__ == '__main__':
@@ -759,11 +803,8 @@ if __name__ == '__main__':
     # turn off loopback and verify that we don't get an echo
     conn.command('CAN_SET_GLOBALS_REQ', operation_mode=0, baud_rate=500000, termination=1, highspeed=0, timestamp=1)
     conn.send('CAN_DATA_REQ', can_id=0x70, can_format=0, can_data=b'123aa')
-    try:
-        echo = conn.recv('CAN_DATA_IND')
-    except RuntimeError:
-        pass
-    else:
+    echo = conn.recv('CAN_DATA_IND')
+    if echo is not None:
         raise RuntimeError('unwanted loopback message')
 
     # expect that out1 and in1 are connected, verify digital and analog loopback
@@ -793,9 +834,12 @@ if __name__ == '__main__':
     # exercise the convenience APIs
     conn.configure(500000, loopback_mode=True)
     conn.send_can(0x80, b'abcdefg')
-    (recv_id, recv_data) = conn.recv_can(expect_id=0x80)
-    assert recv_id == 0x80
-    assert recv_data == b'abcdefg'
+    msg = conn.recv_can(expect_id=0x80)
+    if msg is not None:
+        assert msg['can_id'] == 0x80
+        assert msg['data'] == b'abcdefg'
+    else:
+        raise RuntimeError('CAN loopback failure')
 
     conn.command('CAN_RESTART_REQ')
     conn.close()
