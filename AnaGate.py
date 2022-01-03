@@ -497,7 +497,7 @@ class AG_CAN_connection(AG_connection):
 
         super().__init__('CAN', host_address, port_number)
 
-    def configure(self, baud_rate,
+    def configure(self, baud_rate_kbps,
                   loopback_mode=False,
                   passive_mode=False,
                   enable_termination=False,
@@ -515,13 +515,41 @@ class AG_CAN_connection(AG_connection):
             'ranges': ((start0, end0), (start1, end1), (start2, end2), (start3, end3))
         }
         """
+
+        if baud_rate_kbps not in [1000, 500, 250, 125]:
+            raise RuntimeError(f'baud rate {baud_rate} not supported (expected one of 1000, 500, 250, 125)')
+        baud_rate = baud_rate_kbps * 1000
+
+        # Disable sending / requiring confirmation of CAN data packets, enable reporting of
+        # CAN packets seen on the wire.
+        # Read back the set values to ensure they were accepted.
         self.command('CAN_SET_CONFIG_REQ', data_confirm=0, data_indication=1)
+        cnf = self.command('CAN_GET_CONFIG_REQ')
+        if ((cnf is None) or 
+            cnf.is_failure or 
+            (cnf['data_confirm'] != 0) or 
+            (cnf['data_indication'] != 1)):
+            raise RuntimeError('failed to configure port behaviour')
+
+        # Set operation mode and line speed. Read these back and verify, as the remote may not
+        # report an error for e.g. incorrectly specified line speed.
+        operation_mode = MODE_LOOPBACK if loopback_mode else MODE_PASSIVE if passive_mode else MODE_NORMAL
         self.command('CAN_SET_GLOBALS_REQ',
-                     operation_mode=MODE_LOOPBACK if loopback_mode else MODE_PASSIVE if passive_mode else MODE_NORMAL,
+                     operation_mode=operation_mode,
                      baud_rate=baud_rate,
                      termination=enable_termination,
                      highspeed=1 if filters is None else 0,
                      timestamp=1)
+        cnf = self.command('CAN_GET_GLOBALS_REQ')
+        if ((cnf is None) or
+            cnf.is_failure or
+            (cnf['operation_mode'] != operation_mode) or
+            (cnf['baud_rate'] != baud_rate) or
+            (cnf['termination'] != 1 if enable_termination else 0) or
+            (cnf['highspeed'] != 1 if filters is None else 0)):
+            raise RuntimeError(f'failed to set port operating parameters {cnf}')
+
+        # set or disable filters
         if filters is None:
             self.command('CAN_SET_FILTER_REQ',
                          filter_1_mask=0, filter_1_value=0,
@@ -832,8 +860,8 @@ if __name__ == '__main__':
         print(f'GPIO loopback failed ({str(e)}), maybe out1 and in1 are not connected')
 
     # exercise the convenience APIs
-    conn.configure(500000, loopback_mode=True)
-    conn.send_can(0x80, b'abcdefg')
+    conn.configure(baud_rate_kbps=500, loopback_mode=True)
+    conn.send_can(can_id=0x80, data=b'abcdefg')
     msg = conn.recv_can(expect_id=0x80)
     if msg is not None:
         assert msg['can_id'] == 0x80
